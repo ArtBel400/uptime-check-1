@@ -24,12 +24,14 @@ jobs:
       TG_CHAT: ${{ secrets.TG_CHAT }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Check, notify on state change
+      - name: Check, classify, notify on state change
         run: |
           # Три попытки с паузой 20 с: единичный сбой сети не даёт тревоги
-          web=0; ssh=0
+          web=0; ssh=0; code=000; ttime=0; cexit=0
           for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$TARGET_URL" || true)
+            cexit=0
+            res=$(curl -s -o /dev/null -m 10 -w '%{http_code} %{time_total}' "$TARGET_URL") || cexit=$?
+            code=${res%% *}; ttime=${res##* }
             [ "$code" = "200" ] && { web=1; break; }
             sleep 20
           done
@@ -48,12 +50,31 @@ jobs:
           now=$(TZ=Asia/Almaty date '+%d.%m.%Y %H:%M')
 
           if [ "$web" = 1 ] && [ "$ssh" = 1 ]; then
-            [ "$prev" = "failure" ] && send "✅ bitrix-dev.ioka.kz снова доступен ($now, Алматы)."
+            if [ "$prev" = "failure" ]; then
+              since=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow monitor.yml --status completed \
+                        --limit 50 --json conclusion,createdAt \
+                        | jq -r 'reduce .[] as $r ({done:false,t:null}; if .done then . elif $r.conclusion=="failure" then .t=$r.createdAt else .done=true end) | .t // empty' || true)
+              dur=""
+              if [ -n "$since" ]; then
+                mins=$(( ($(date +%s) - $(date -d "$since" +%s)) / 60 ))
+                dur=" Простой около ${mins} мин."
+              fi
+              send "✅ bitrix-dev.ioka.kz снова доступен ($now, Алматы).$dur"
+            fi
             exit 0
           fi
 
-          problems=""
-          if [ "$web" = 0 ]; then problems="${problems}"$'\n'"• портал (HTTPS) не отвечает 200 (последний код: ${code:-нет ответа})"; fi
-          if [ "$ssh" = 0 ]; then problems="${problems}"$'\n'"• порт 22 (SSH) недоступен"; fi
-          [ "$prev" != "failure" ] && send "🔴 bitrix-dev.ioka.kz недоступен ($now, Алматы).$problems"
+          if [ "$web" = 0 ] && [ "$ssh" = 0 ]; then
+            kind="Порт 22 и сайт молчат одновременно: похоже на зависание ОС или виртуалки либо обрыв сети на стороне хостинга (как 23.10). Проверьте консоль и статус хостинга."
+          elif [ "$web" = 0 ]; then
+            case "$code" in
+              5*) kind="ОС жива (порт 22 открыт), но сайт отдаёт ошибку $code: вероятно, упал или завис Apache, MySQL либо PHP." ;;
+              000) kind="ОС жива (порт 22 открыт), но сайт не отвечает (curl код $cexit): вероятно, упал или перегружен nginx/Apache." ;;
+              *) kind="ОС жива (порт 22 открыт), но сайт отвечает кодом $code вместо 200." ;;
+            esac
+          else
+            kind="Сайт работает, но порт 22 недоступен: возможно, бан fail2ban или сбой sshd."
+          fi
+          detail="Код ответа сайта: $code, время: ${ttime} с."
+          [ "$prev" != "failure" ] && send "$(printf '%s\n' "🔴 bitrix-dev.ioka.kz недоступен ($now, Алматы)." "$kind" "$detail")"
           exit 1
