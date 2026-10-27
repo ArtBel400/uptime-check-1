@@ -1,0 +1,59 @@
+name: monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TARGET_URL: ${{ secrets.TARGET_URL }}
+      TARGET_HOST: ${{ secrets.TARGET_HOST }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check, notify on state change
+        run: |
+          # Три попытки с паузой 20 с: единичный сбой сети не даёт тревоги
+          web=0; ssh=0
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$TARGET_URL" || true)
+            [ "$code" = "200" ] && { web=1; break; }
+            sleep 20
+          done
+          for i in 1 2 3; do
+            timeout 5 bash -c "</dev/tcp/$TARGET_HOST/22" 2>/dev/null && { ssh=1; break; }
+            sleep 20
+          done
+
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow monitor.yml \
+                   --status completed --limit 1 --json conclusion -q '.[0].conclusion' || true)
+
+          send() {
+            curl -s -m 15 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="$TG_CHAT" --data-urlencode "text=$1" >/dev/null
+          }
+          now=$(TZ=Asia/Almaty date '+%d.%m.%Y %H:%M')
+
+          if [ "$web" = 1 ] && [ "$ssh" = 1 ]; then
+            [ "$prev" = "failure" ] && send "✅ bitrix-dev.ioka.kz снова доступен ($now, Алматы)."
+            exit 0
+          fi
+
+          problems=""
+          if [ "$web" = 0 ]; then problems="${problems}"$'\n'"• портал (HTTPS) не отвечает 200 (последний код: ${code:-нет ответа})"; fi
+          if [ "$ssh" = 0 ]; then problems="${problems}"$'\n'"• порт 22 (SSH) недоступен"; fi
+          [ "$prev" != "failure" ] && send "🔴 bitrix-dev.ioka.kz недоступен ($now, Алматы).$problems"
+          exit 1
